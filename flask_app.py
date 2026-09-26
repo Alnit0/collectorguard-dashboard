@@ -11,16 +11,21 @@ TB_API = f"https://thingsboard.cloud/api/plugins/telemetry/DEVICE/{DEVICE_ID}/va
 HEADERS = {"X-Authorization": f"ApiKey {API_KEY}"}
 
 SAFE_RANGE = (0, 100)
+REFRESH_INTERVAL_MS = 5000
 
 
 @app.route("/")
 def dashboard():
-    return """
+    return f"""
     <html>
     <head>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     </head>
     <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+        <div id="countdown" style="position: fixed; top: 10px; right: 15px; font-size: 14px; color: #666; font-family: monospace;">
+            Next refresh in: <span id="countdownValue">{REFRESH_INTERVAL_MS}</span> ms
+        </div>
+
         <h1>CollectorGuard Dashboard</h1>
         <p id="valueText" style="font-size: 48px;">Loading...</p>
         <p id="statusText" style="font-size: 32px;"></p>
@@ -29,8 +34,10 @@ def dashboard():
 
         <script>
             let chart;
+            const REFRESH_MS = {REFRESH_INTERVAL_MS};
+            let remaining = REFRESH_MS;
 
-            async function loadCurrent() {
+            async function loadCurrent() {{
                 const res = await fetch('/current');
                 const data = await res.json();
 
@@ -38,44 +45,52 @@ def dashboard():
                 const statusEl = document.getElementById('statusText');
                 statusEl.innerText = data.status;
                 statusEl.style.color = data.status === 'SAFE' ? 'green' : (data.status === 'ALERT' ? 'red' : 'grey');
-            }
+            }}
 
-            async function loadChart() {
+            async function loadChart() {{
                 const res = await fetch('/chart-data');
                 const data = await res.json();
                 const labels = data.labels.map(ts => new Date(ts).toLocaleTimeString());
 
-                if (!chart) {
-                    chart = new Chart(document.getElementById('lightChart'), {
+                if (!chart) {{
+                    chart = new Chart(document.getElementById('lightChart'), {{
                         type: 'line',
-                        data: {
+                        data: {{
                             labels: labels,
-                            datasets: [{
+                            datasets: [{{
                                 label: 'Light level',
                                 data: data.values,
                                 borderColor: 'green',
                                 tension: 0.2
-                            }]
-                        },
-                        options: {
-                            scales: { y: { beginAtZero: true } },
+                            }}]
+                        }},
+                        options: {{
+                            scales: {{ y: {{ beginAtZero: true }} }},
                             animation: false
-                        }
-                    });
-                } else {
+                        }}
+                    }});
+                }} else {{
                     chart.data.labels = labels;
                     chart.data.datasets[0].data = data.values;
                     chart.update();
-                }
-            }
+                }}
+            }}
 
-            function refreshAll() {
+            function refreshAll() {{
                 loadCurrent();
                 loadChart();
-            }
+                remaining = REFRESH_MS;
+            }}
 
+            // Countdown ticks every 100ms for a smooth display
+            setInterval(() => {{
+                remaining -= 100;
+                if (remaining < 0) remaining = 0;
+                document.getElementById('countdownValue').innerText = remaining;
+            }}, 100);
+
+            setInterval(refreshAll, REFRESH_MS);
             refreshAll();
-            setInterval(refreshAll, 5000);
         </script>
     </body>
     </html>
@@ -100,7 +115,7 @@ def current():
 @app.route("/chart-data")
 def chart_data():
     end_ts = int(time.time() * 1000)
-    start_ts = end_ts - (60 * 60 * 1000)  # last 60 minutes
+    start_ts = end_ts - (60 * 60 * 1000)
 
     url = f"{TB_API}?keys=light&startTs={start_ts}&endTs={end_ts}&limit=1000&orderBy=ASC"
     resp = requests.get(url, headers=HEADERS)
