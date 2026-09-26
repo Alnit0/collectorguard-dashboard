@@ -15,6 +15,75 @@ SAFE_RANGE = (0, 100)
 
 @app.route("/")
 def dashboard():
+    return """
+    <html>
+    <head>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+    </head>
+    <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+        <h1>CollectorGuard Dashboard</h1>
+        <p id="valueText" style="font-size: 48px;">Loading...</p>
+        <p id="statusText" style="font-size: 32px;"></p>
+
+        <canvas id="lightChart" width="600" height="300" style="margin: 0 auto; display: block;"></canvas>
+
+        <script>
+            let chart;
+
+            async function loadCurrent() {
+                const res = await fetch('/current');
+                const data = await res.json();
+
+                document.getElementById('valueText').innerText = 'Light: ' + data.value;
+                const statusEl = document.getElementById('statusText');
+                statusEl.innerText = data.status;
+                statusEl.style.color = data.status === 'SAFE' ? 'green' : (data.status === 'ALERT' ? 'red' : 'grey');
+            }
+
+            async function loadChart() {
+                const res = await fetch('/chart-data');
+                const data = await res.json();
+                const labels = data.labels.map(ts => new Date(ts).toLocaleTimeString());
+
+                if (!chart) {
+                    chart = new Chart(document.getElementById('lightChart'), {
+                        type: 'line',
+                        data: {
+                            labels: labels,
+                            datasets: [{
+                                label: 'Light level',
+                                data: data.values,
+                                borderColor: 'green',
+                                tension: 0.2
+                            }]
+                        },
+                        options: {
+                            scales: { y: { beginAtZero: true } },
+                            animation: false
+                        }
+                    });
+                } else {
+                    chart.data.labels = labels;
+                    chart.data.datasets[0].data = data.values;
+                    chart.update();
+                }
+            }
+
+            function refreshAll() {
+                loadCurrent();
+                loadChart();
+            }
+
+            refreshAll();
+            setInterval(refreshAll, 5000);
+        </script>
+    </body>
+    </html>
+    """
+
+
+@app.route("/current")
+def current():
     resp = requests.get(f"{TB_API}?keys=light", headers=HEADERS)
     data = resp.json()
     latest_value = data.get("light", [{}])[0].get("value") if data.get("light") else None
@@ -22,52 +91,10 @@ def dashboard():
     if latest_value is not None:
         value = float(latest_value)
         status = "SAFE" if SAFE_RANGE[0] <= value <= SAFE_RANGE[1] else "ALERT"
-        colour = "green" if status == "SAFE" else "red"
     else:
-        value, status, colour = "no data", "-", "grey"
+        value, status = "no data", "-"
 
-    return f"""
-    <html>
-    <head>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-    </head>
-    <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-        <h1>CollectorGuard Dashboard</h1>
-        <p style="font-size: 48px;">Light: {value}</p>
-        <p style="font-size: 32px; color: {colour};">{status}</p>
-
-        <canvas id="lightChart" width="600" height="300" style="margin: 0 auto; display: block;"></canvas>
-
-        <script>
-            async function loadChart() {{
-                const res = await fetch('/chart-data');
-                const data = await res.json();
-
-                const labels = data.labels.map(ts => new Date(ts).toLocaleTimeString());
-
-                new Chart(document.getElementById('lightChart'), {{
-                    type: 'line',
-                    data: {{
-                        labels: labels,
-                        datasets: [{{
-                            label: 'Light level',
-                            data: data.values,
-                            borderColor: 'green',
-                            tension: 0.2
-                        }}]
-                    }},
-                    options: {{
-                        scales: {{ y: {{ beginAtZero: true }} }}
-                    }}
-                }});
-            }}
-            loadChart();
-        </script>
-
-        <p><a href="/">Refresh</a></p>
-    </body>
-    </html>
-    """
+    return jsonify({"value": value, "status": status})
 
 
 @app.route("/chart-data")
