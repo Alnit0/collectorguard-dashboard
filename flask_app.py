@@ -13,7 +13,13 @@ SAFE_RANGE = (0, 100)
 
 @app.route("/")
 def dashboard():
+    print(f"DEVICE_ID: {DEVICE_ID}")
+    print(f"API_KEY present: {bool(API_KEY)}")
+
     resp = requests.get(f"{TB_API}?keys=light", headers=HEADERS)
+    print(f"Status: {resp.status_code}")
+    print(f"Body: {resp.text[:300]}")
+
     data = resp.json()
     latest_value = data.get("light", [{}])[0].get("value") if data.get("light") else None
 
