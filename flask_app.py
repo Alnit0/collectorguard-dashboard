@@ -12,6 +12,7 @@ HEADERS = {"X-Authorization": f"ApiKey {API_KEY}"}
 
 SAFE_RANGE = (0, 100)
 REFRESH_INTERVAL_MS = 5000
+STALE_THRESHOLD_SECONDS = 30  # if last reading is older than this, treat as offline
 
 
 @app.route("/")
@@ -24,6 +25,10 @@ def dashboard():
     <body style="font-family: sans-serif; text-align: center; margin-top: 50px;">
         <div id="countdown" style="position: fixed; top: 10px; right: 15px; font-size: 14px; color: #666; font-family: monospace;">
             Next refresh in: <span id="countdownValue">{REFRESH_INTERVAL_MS}</span> ms
+        </div>
+
+        <div id="deviceStatus" style="position: fixed; top: 10px; left: 15px; font-size: 14px; font-family: monospace; font-weight: bold;">
+            Checking...
         </div>
 
         <h1>CollectorGuard Dashboard</h1>
@@ -45,6 +50,15 @@ def dashboard():
                 const statusEl = document.getElementById('statusText');
                 statusEl.innerText = data.status;
                 statusEl.style.color = data.status === 'SAFE' ? 'green' : (data.status === 'ALERT' ? 'red' : 'grey');
+
+                const deviceEl = document.getElementById('deviceStatus');
+                if (data.device_online) {{
+                    deviceEl.innerText = '● Device online';
+                    deviceEl.style.color = 'green';
+                }} else {{
+                    deviceEl.innerText = '● Device offline';
+                    deviceEl.style.color = 'red';
+                }}
             }}
 
             async function loadChart() {{
@@ -82,7 +96,6 @@ def dashboard():
                 remaining = REFRESH_MS;
             }}
 
-            // Countdown ticks every 100ms for a smooth display
             setInterval(() => {{
                 remaining -= 100;
                 if (remaining < 0) remaining = 0;
@@ -101,7 +114,15 @@ def dashboard():
 def current():
     resp = requests.get(f"{TB_API}?keys=light", headers=HEADERS)
     data = resp.json()
-    latest_value = data.get("light", [{}])[0].get("value") if data.get("light") else None
+
+    light_data = data.get("light", [])
+    latest_value = light_data[0].get("value") if light_data else None
+    latest_ts = light_data[0].get("ts") if light_data else None
+
+    device_online = False
+    if latest_ts is not None:
+        age_seconds = (time.time() * 1000 - latest_ts) / 1000
+        device_online = age_seconds <= STALE_THRESHOLD_SECONDS
 
     if latest_value is not None:
         value = float(latest_value)
@@ -109,7 +130,7 @@ def current():
     else:
         value, status = "no data", "-"
 
-    return jsonify({"value": value, "status": status})
+    return jsonify({"value": value, "status": status, "device_online": device_online})
 
 
 @app.route("/chart-data")
