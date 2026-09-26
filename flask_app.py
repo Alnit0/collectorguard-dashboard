@@ -4,14 +4,16 @@ import requests
 
 app = Flask(__name__)
 
-THINGSBOARD_TOKEN = os.environ.get("TB_DEVICE_TOKEN")
-TB_API = f"http://thingsboard.cloud/api/v1/{THINGSBOARD_TOKEN}/telemetry"
+DEVICE_ID = os.environ.get("TB_DEVICE_ID")
+API_KEY = os.environ.get("TB_API_KEY")
+TB_API = f"https://thingsboard.cloud/api/plugins/telemetry/DEVICE/{DEVICE_ID}/values/timeseries"
+HEADERS = {"X-Authorization": f"ApiKey {API_KEY}"}
 
 SAFE_RANGE = (0, 100)
 
 @app.route("/")
 def dashboard():
-    resp = requests.get(TB_API)
+    resp = requests.get(f"{TB_API}?keys=light", headers=HEADERS)
     data = resp.json()
     latest_value = data.get("light", [{}])[0].get("value") if data.get("light") else None
 
