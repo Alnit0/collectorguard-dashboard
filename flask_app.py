@@ -47,6 +47,7 @@ KNOWN_SENSORS = [
     "light_raw", "light_percent", "uv_raw", "uv_percent",
     "temperature_c", "humidity_percent",
     "lid_closed", "tilt_deg", "knock_peak",
+    "accel_x", "accel_y", "accel_z",
 ]
 
 _cache = {}
@@ -265,6 +266,22 @@ PAGE = r"""<!doctype html>
   .scrollTable { max-height: 360px; overflow-y: auto; border: 1px solid #eef0f3; border-radius: 8px; }
   pre.rawJson { background: #11161d; color: #c9d1d9; padding: 12px; border-radius: 8px; overflow-x: auto;
                 font-size: 12px; max-height: 320px; }
+
+  .orientWrap { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: center; }
+  .scene3d { width: 160px; height: 160px; perspective: 500px; flex: 0 0 auto; }
+  .cubeSpin { width: 100%; height: 100%; position: relative; transform-style: preserve-3d;
+              transition: transform 0.4s ease-out; transform: rotateX(0deg) rotateZ(0deg); }
+  .cubeFace { position: absolute; width: 90px; height: 90px; left: 35px; top: 35px;
+              display: flex; align-items: center; justify-content: center;
+              font-size: 11px; font-weight: 700; color: #fff; border: 1px solid rgba(255,255,255,0.25); }
+  .faceTop    { background: #2e9e4f; transform: rotateX(90deg) translateZ(45px); }
+  .faceBottom { background: #6b7280; transform: rotateX(-90deg) translateZ(45px); }
+  .faceFront  { background: #2e6fe0; transform: translateZ(45px); }
+  .faceBack   { background: #2e6fe0; transform: rotateY(180deg) translateZ(45px); }
+  .faceRight  { background: #7c5cd6; transform: rotateY(90deg) translateZ(45px); }
+  .faceLeft   { background: #7c5cd6; transform: rotateY(-90deg) translateZ(45px); }
+  .orientReadout { min-width: 160px; font-size: 14px; line-height: 1.8; }
+  .orientReadout .big { font-size: 20px; margin: 0; }
 </style>
 </head>
 <body>
@@ -321,6 +338,24 @@ PAGE = r"""<!doctype html>
         <div class="big" id="vKnocks">--</div>
         <div class="label">Knocks, last hour</div>
         <div class="sub" id="sKnock">latest interval peak --</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Box orientation</h2>
+      <p class="muted">The green face is the top of the box, worked out live from the accelerometer. If the box is lying on its side or upside down, the green face moves to show it.</p>
+      <div class="orientWrap">
+        <div class="scene3d">
+          <div class="cubeSpin" id="orientCube">
+            <div class="cubeFace faceTop">TOP</div>
+            <div class="cubeFace faceBottom"></div>
+            <div class="cubeFace faceFront"></div>
+            <div class="cubeFace faceBack"></div>
+            <div class="cubeFace faceRight"></div>
+            <div class="cubeFace faceLeft"></div>
+          </div>
+        </div>
+        <div class="orientReadout" id="orientText">Waiting for accelerometer data...</div>
       </div>
     </div>
 
@@ -494,6 +529,32 @@ PAGE = r"""<!doctype html>
     document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
   }
 
+  function updateOrientation(L) {
+    const cube = document.getElementById('orientCube');
+    const text = document.getElementById('orientText');
+    const ax = L.accel_x, ay = L.accel_y, az = L.accel_z;
+    if (ax === undefined || ay === undefined || az === undefined) {
+      text.textContent = 'Waiting for accelerometer data...';
+      return;
+    }
+    // Y is the sensor's "up" axis when the box is sitting level. These two angles describe
+    // how far it leans away from that, in the two directions perpendicular to Y.
+    const pitch = Math.atan2(ax, Math.sqrt(ay * ay + az * az)) * 180 / Math.PI;
+    const roll = Math.atan2(az, Math.sqrt(ax * ax + ay * ay)) * 180 / Math.PI;
+
+    // Mapping these two angles onto the cube's rotation is a best guess at which way is
+    // "forward" on the physical box. If the cube leans the wrong way compared to the real
+    // box, swap the sign on one of the two lines below, that's the only thing to adjust.
+    cube.style.transform = `rotateX(${roll}deg) rotateZ(${-pitch}deg)`;
+
+    const upsideDown = ay < 0;
+    text.innerHTML =
+      `<div class="big">${upsideDown ? 'UPSIDE DOWN' : 'Right side up'}</div>` +
+      `Lean one way: ${pitch.toFixed(1)}&deg;<br>` +
+      `Lean the other way: ${roll.toFixed(1)}&deg;<br>` +
+      `Raw: X ${fmt(ax, 2)} / Y ${fmt(ay, 2)} / Z ${fmt(az, 2)}`;
+  }
+
   async function loadLive() {
     try {
       const res = await fetch('/api/live');
@@ -518,6 +579,8 @@ PAGE = r"""<!doctype html>
 
       setGauge('tilt', L.tilt_deg, TILT_GAUGE_MAX);
       document.getElementById('vTilt').textContent = fmt(L.tilt_deg, 1) + '\u00B0';
+
+      updateOrientation(L);
 
       document.getElementById('vTemp').textContent = (L.temperature_c === undefined) ? '--' : fmt(L.temperature_c, 1) + '\u00B0C';
       document.getElementById('vHumidity').textContent = (L.humidity_percent === undefined) ? '--' : fmt(L.humidity_percent, 0) + '%';
@@ -557,7 +620,8 @@ PAGE = r"""<!doctype html>
       light_raw: 'Light (raw)', light_percent: 'Light (%)',
       uv_raw: 'UV (raw)', uv_percent: 'UV (%)',
       temperature_c: 'Temperature (\u00B0C)', humidity_percent: 'Humidity (%)',
-      lid_closed: 'Lid closed (1/0)', tilt_deg: 'Tilt (degrees)', knock_peak: 'Knock peak (m/s\u00B2)'
+      lid_closed: 'Lid closed (1/0)', tilt_deg: 'Tilt (degrees)', knock_peak: 'Knock peak (m/s\u00B2)',
+      accel_x: 'Accelerometer X (raw)', accel_y: 'Accelerometer Y (raw)', accel_z: 'Accelerometer Z (raw)'
     };
     const known = (lastLiveData && lastLiveData.known_sensors) ||
       ['light_percent', 'uv_percent', 'temperature_c', 'humidity_percent', 'tilt_deg', 'knock_peak', 'lid_closed', 'light_raw', 'uv_raw'];
