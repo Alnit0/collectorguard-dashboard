@@ -267,7 +267,10 @@ PAGE = r"""<!doctype html>
   pre.rawJson { background: #11161d; color: #c9d1d9; padding: 12px; border-radius: 8px; overflow-x: auto;
                 font-size: 12px; max-height: 320px; }
 
-  .orientWrap { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: center; }
+  details.panel summary { cursor: pointer; font-weight: 600; font-size: 16px; }
+  details.panel[open] summary { margin-bottom: 10px; }
+  .orientWrap { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: center;
+                margin-top: 4px; }
   .scene3d { width: 160px; height: 160px; perspective: 500px; flex: 0 0 auto; }
   .cubeSpin { width: 100%; height: 100%; position: relative; transform-style: preserve-3d;
               transition: transform 0.4s ease-out; transform: rotateX(0deg) rotateZ(0deg); }
@@ -341,9 +344,8 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
 
-    <div class="panel">
-      <h2>Box orientation</h2>
-      <p class="muted">The green face is the top of the box, worked out live from the accelerometer. If the box is lying on its side or upside down, the green face moves to show it.</p>
+    <details class="panel">
+      <summary>Box orientation (3D view)</summary>
       <div class="orientWrap">
         <div class="scene3d">
           <div class="cubeSpin" id="orientCube">
@@ -357,7 +359,7 @@ PAGE = r"""<!doctype html>
         </div>
         <div class="orientReadout" id="orientText">Waiting for accelerometer data...</div>
       </div>
-    </div>
+    </details>
 
     <div class="panel">
       <h2>Recent events</h2>
