@@ -9,6 +9,13 @@ Settings come from environment variables on Render:
     STALE_SECONDS   seconds without new data before the device shows as offline (default 30).
                     Use about 150 when the Pi logs every 60 seconds.
     TB_BASE         only if you use a different ThingsBoard address (default https://thingsboard.cloud)
+
+Three views, switched with the tabs at the top:
+  Overview  - gauges and current status, same as before
+  Raw data  - every value from the latest poll shown plainly, plus the full JSON response,
+              for debugging what is actually arriving
+  History   - pick a sensor and a time window (last hour/24 hours/7 days, or a specific day),
+              see it as a chart, and a table of the exact points behind it
 """
 
 import os
@@ -31,9 +38,14 @@ REFRESH_MS = 5000
 TB_TIMEOUT = 10
 EVENT_LIMIT = 30
 EVENT_HOURS = 24
+MAX_CHART_ROWS = 3000          # most rows ever returned for one chart/table request
+MAX_RANGE_MS = 8 * 24 * 3600 * 1000   # 8 days, a safety cap on how wide a single query can be
 
-LIVE_KEYS = [
+# Every sensor the Pi currently writes. If another one gets added later, add its name here too,
+# the rest of the page (the picker, the raw table) adapts on its own.
+KNOWN_SENSORS = [
     "light_raw", "light_percent", "uv_raw", "uv_percent",
+    "temperature_c", "humidity_percent",
     "lid_closed", "tilt_deg", "knock_peak",
 ]
 
@@ -107,18 +119,22 @@ def no_store(response):
 
 @app.route("/api/live")
 def api_live():
+    """Everything the Overview and Raw tabs need: the latest value of every known sensor,
+    plus recent events. 'latest' is deliberately plain, key -> number, so the Raw tab can show
+    exactly what arrived with no formatting or interpretation applied."""
     problem = config_problem()
     if problem:
         return jsonify({"error": problem})
     try:
-        raw = tb_get({"keys": ",".join(LIVE_KEYS)})
+        raw = tb_get({"keys": ",".join(KNOWN_SENSORS)})
         events, truncated = fetch_events()
     except Exception as e:
         return jsonify({"error": f"Could not read from ThingsBoard: {e}"})
 
     latest = {}
+    latest_ts = {}
     newest_ts = 0
-    for key in LIVE_KEYS:
+    for key in KNOWN_SENSORS:
         points = raw.get(key) or []
         if not points:
             continue
@@ -126,42 +142,72 @@ def api_live():
         if value is None:
             continue
         latest[key] = value
-        newest_ts = max(newest_ts, int(points[0]["ts"]))
+        latest_ts[key] = int(points[0]["ts"])
+        newest_ts = max(newest_ts, latest_ts[key])
 
     age = None if not newest_ts else max(0.0, time.time() - newest_ts / 1000)
     return jsonify({
         "latest": latest,
+        "latest_ts": latest_ts,
         "age_seconds": age,
         "device_online": age is not None and age <= STALE_SECONDS,
         "events": events,
         "events_truncated": truncated,
+        "known_sensors": KNOWN_SENSORS,
     })
 
 
 @app.route("/api/chart")
 def api_chart():
+    """One sensor's history, for the History tab's chart and its drill-down table underneath.
+
+    Either pass `minutes` (a quick window ending now), or both `start_ts` and `end_ts` in
+    milliseconds (for a specific calendar day, computed in the browser so it matches the
+    viewer's own timezone, not the server's).
+    """
     problem = config_problem()
     if problem:
         return jsonify({"error": problem})
-    minutes = request.args.get("minutes", default=60, type=int)
-    minutes = max(5, min(minutes, 1440))
 
-    end = bucket_ms(5)
-    start = end - minutes * 60 * 1000
+    sensor = request.args.get("sensor", default="light_percent")
+    if sensor not in KNOWN_SENSORS:
+        return jsonify({"error": f"Unknown sensor '{sensor}'"})
+
+    start_ts = request.args.get("start_ts", type=int)
+    end_ts = request.args.get("end_ts", type=int)
+    if start_ts is not None and end_ts is not None:
+        start, end = start_ts, end_ts
+    else:
+        minutes = request.args.get("minutes", default=60, type=int)
+        minutes = max(5, min(minutes, 10080))   # 5 minutes to 7 days
+        end = bucket_ms(5)
+        start = end - minutes * 60 * 1000
+
+    if end <= start:
+        return jsonify({"error": "End of range must be after the start"})
+    if end - start > MAX_RANGE_MS:
+        start = end - MAX_RANGE_MS
+
     try:
-        # DESC + limit returns the newest points, which are the ones that matter for a live view
-        data = tb_get({"keys": "light_percent,uv_percent", "startTs": start, "endTs": end,
-                       "limit": 5000, "orderBy": "DESC"}, ttl=5)
+        # DESC + limit keeps the newest points when a range holds more than the limit allows,
+        # which matters most for "last 24 hours" on a busy sensor, the recent end is what a
+        # live view needs most.
+        data = tb_get({"keys": sensor, "startTs": start, "endTs": end,
+                       "limit": MAX_CHART_ROWS, "orderBy": "DESC"}, ttl=5)
     except Exception as e:
         return jsonify({"error": f"Could not read from ThingsBoard: {e}"})
 
-    light = {p["ts"]: num(p["value"]) for p in (data.get("light_percent") or [])}
-    uv = {p["ts"]: num(p["value"]) for p in (data.get("uv_percent") or [])}
-    rows = [{"ts": ts, "light": light.get(ts), "uv": uv.get(ts)} for ts in sorted(set(light) | set(uv))]
+    points = data.get(sensor) or []
+    rows = [{"ts": int(p["ts"]), "value": num(p["value"])} for p in points if num(p["value"]) is not None]
+    rows.sort(key=lambda r: r["ts"])
 
-    step = max(1, -(-len(rows) // 400))   # keep the chart to about 400 points, counting back from the newest
-    rows = rows[::-1][::step][::-1]
-    return jsonify({"minutes": minutes, "rows": rows})
+    return jsonify({
+        "sensor": sensor,
+        "start_ts": start,
+        "end_ts": end,
+        "rows": rows,
+        "truncated": len(rows) >= MAX_CHART_ROWS,
+    })
 
 
 PAGE = r"""<!doctype html>
@@ -175,8 +221,8 @@ PAGE = r"""<!doctype html>
   * { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 20px;
          background: #f5f6f8; color: #1f2933; }
-  .wrap { max-width: 900px; margin: 0 auto; }
-  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; margin-bottom: 14px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; margin-bottom: 10px; }
   h1 { margin: 0; font-size: 26px; }
   h2 { font-size: 16px; margin: 0 0 10px; }
   .muted { color: #6b7280; font-size: 14px; }
@@ -185,6 +231,14 @@ PAGE = r"""<!doctype html>
                background: rgba(255,255,255,0.85); padding: 2px 6px; border-radius: 4px; }
   #errorBanner { background: #fde8e8; color: #9b1c1c; border: 1px solid #f5b5b5; padding: 10px 14px;
                  border-radius: 8px; margin-bottom: 14px; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid #e2e5e9; }
+  .tabs button { border: none; background: none; padding: 10px 14px; font-size: 14px; cursor: pointer;
+                 color: #6b7280; border-bottom: 2px solid transparent; }
+  .tabs button.active { color: #1f2933; border-bottom-color: #1f2933; font-weight: 600; }
+  .tabpanel { display: none; }
+  .tabpanel.active { display: block; }
+
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 14px; }
   .card { background: #fff; border-radius: 10px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); text-align: center; }
   .gaugeWrap { position: relative; height: 110px; }
@@ -194,15 +248,23 @@ PAGE = r"""<!doctype html>
   .sub { color: #6b7280; font-size: 13px; margin-top: 2px; min-height: 1.2em; }
   .big { font-size: 30px; font-weight: 700; margin: 16px 0 6px; }
   .panel { background: #fff; border-radius: 10px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 14px; }
-  .chartHead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .chartHead button { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 4px 10px;
-                      margin-left: 6px; cursor: pointer; font-size: 13px; }
+
+  .chartHead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .chartHead select, .chartHead button { border: 1px solid #d1d5db; background: #fff; border-radius: 6px;
+                      padding: 5px 10px; cursor: pointer; font-size: 13px; }
   .chartHead button.active { background: #1f2933; color: #fff; border-color: #1f2933; }
-  #chartBox { position: relative; height: 260px; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th { text-align: left; color: #6b7280; font-weight: 600; padding: 4px 6px; }
-  td { padding: 6px; border-top: 1px solid #eef0f3; vertical-align: top; }
+  #chartBox { position: relative; height: 280px; }
+
+  #dayPicker { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 10px; }
+  #dayPicker button { flex: 0 0 auto; white-space: nowrap; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: #6b7280; font-weight: 600; padding: 4px 6px; position: sticky; top: 0; background: #fff; }
+  td { padding: 5px 6px; border-top: 1px solid #eef0f3; vertical-align: top; font-variant-numeric: tabular-nums; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .scrollTable { max-height: 360px; overflow-y: auto; border: 1px solid #eef0f3; border-radius: 8px; }
+  pre.rawJson { background: #11161d; color: #c9d1d9; padding: 12px; border-radius: 8px; overflow-x: auto;
+                font-size: 12px; max-height: 320px; }
 </style>
 </head>
 <body>
@@ -216,52 +278,108 @@ PAGE = r"""<!doctype html>
 
   <div id="errorBanner" hidden></div>
 
-  <div class="grid">
-    <div class="card">
-      <div class="gaugeWrap"><canvas id="gLight"></canvas><div class="gaugeValue" id="vLight">--</div></div>
-      <div class="label">Light</div>
-      <div class="sub" id="sLight">raw --</div>
-    </div>
-    <div class="card">
-      <div class="gaugeWrap"><canvas id="gUv"></canvas><div class="gaugeValue" id="vUv">--</div></div>
-      <div class="label">UV</div>
-      <div class="sub" id="sUv">raw --</div>
-    </div>
-    <div class="card">
-      <div class="gaugeWrap"><canvas id="gTilt"></canvas><div class="gaugeValue" id="vTilt">--</div></div>
-      <div class="label">Tilt</div>
-      <div class="sub">degrees from resting position</div>
-    </div>
-    <div class="card">
-      <div class="big" id="vLid">--</div>
-      <div class="label">Lid</div>
-      <div class="sub">reed switch</div>
-    </div>
-    <div class="card">
-      <div class="big" id="vKnocks">--</div>
-      <div class="label">Knocks, last hour</div>
-      <div class="sub" id="sKnock">latest interval peak --</div>
-    </div>
+  <div class="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="raw">Raw data</button>
+    <button data-tab="history">History</button>
   </div>
 
-  <div class="panel">
-    <div class="chartHead">
-      <h2>Light and UV over time (% scale)</h2>
-      <div id="windowButtons">
-        <button data-min="15">15 min</button>
-        <button data-min="60" class="active">1 hour</button>
-        <button data-min="180">3 hours</button>
+  <!-- ===================== Overview ===================== -->
+  <div id="tab-overview" class="tabpanel active">
+    <div class="grid">
+      <div class="card">
+        <div class="gaugeWrap"><canvas id="gLight"></canvas><div class="gaugeValue" id="vLight">--</div></div>
+        <div class="label">Light</div>
+        <div class="sub" id="sLight">raw --</div>
+      </div>
+      <div class="card">
+        <div class="gaugeWrap"><canvas id="gUv"></canvas><div class="gaugeValue" id="vUv">--</div></div>
+        <div class="label">UV</div>
+        <div class="sub" id="sUv">raw --</div>
+      </div>
+      <div class="card">
+        <div class="gaugeWrap"><canvas id="gTilt"></canvas><div class="gaugeValue" id="vTilt">--</div></div>
+        <div class="label">Tilt</div>
+        <div class="sub">degrees from resting position</div>
+      </div>
+      <div class="card">
+        <div class="big" id="vTemp">--</div>
+        <div class="label">Temperature</div>
+        <div class="sub" id="sTemp">&nbsp;</div>
+      </div>
+      <div class="card">
+        <div class="big" id="vHumidity">--</div>
+        <div class="label">Humidity</div>
+        <div class="sub" id="sHumidity">&nbsp;</div>
+      </div>
+      <div class="card">
+        <div class="big" id="vLid">--</div>
+        <div class="label">Lid</div>
+        <div class="sub">reed switch</div>
+      </div>
+      <div class="card">
+        <div class="big" id="vKnocks">--</div>
+        <div class="label">Knocks, last hour</div>
+        <div class="sub" id="sKnock">latest interval peak --</div>
       </div>
     </div>
-    <div id="chartBox"><canvas id="trendChart"></canvas></div>
+
+    <div class="panel">
+      <h2>Recent events</h2>
+      <div class="scrollTable">
+        <table>
+          <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+          <tbody id="eventRows"><tr><td colspan="3" class="muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
-  <div class="panel">
-    <h2>Recent events</h2>
-    <table>
-      <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
-      <tbody id="eventRows"><tr><td colspan="3" class="muted">Loading...</td></tr></tbody>
-    </table>
+  <!-- ===================== Raw data ===================== -->
+  <div id="tab-raw" class="tabpanel">
+    <div class="panel">
+      <h2>Latest value per sensor</h2>
+      <p class="muted">Exactly what the last poll returned, with no formatting or conversion applied.</p>
+      <table>
+        <thead><tr><th>Sensor key</th><th>Raw value</th><th>Age</th></tr></thead>
+        <tbody id="rawRows"><tr><td colspan="3" class="muted">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Full response (/api/live)</h2>
+      <p class="muted">The complete JSON this page is reading from, for when the table above isn't enough.</p>
+      <pre class="rawJson" id="rawJson">Loading...</pre>
+    </div>
+  </div>
+
+  <!-- ===================== History ===================== -->
+  <div id="tab-history" class="tabpanel">
+    <div class="panel">
+      <div class="chartHead">
+        <div>
+          <select id="sensorSelect"></select>
+        </div>
+        <div id="rangeButtons">
+          <button data-minutes="60">Last hour</button>
+          <button data-minutes="1440" class="active">Last 24 hours</button>
+          <button data-minutes="10080">Last 7 days</button>
+        </div>
+      </div>
+      <div id="dayPicker"></div>
+      <div id="chartBox"><canvas id="historyChart"></canvas></div>
+      <p class="muted" id="chartRangeText">&nbsp;</p>
+    </div>
+
+    <div class="panel">
+      <h2>Data behind this chart</h2>
+      <p class="muted" id="drillInfo">&nbsp;</p>
+      <div class="scrollTable">
+        <table>
+          <thead><tr><th>Time</th><th>Value</th></tr></thead>
+          <tbody id="historyRows"><tr><td colspan="2" class="muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -269,20 +387,33 @@ PAGE = r"""<!doctype html>
   const REFRESH_MS = __REFRESH_MS__;
   const TILT_GAUGE_MAX = 45;
   const gauges = {};
-  let trendChart = null;
-  let chartMinutes = 60;
-  let lastChartLoad = 0;
   let remaining = REFRESH_MS;
+  let currentTab = 'overview';
 
-  const EVENT_LABELS = {
-    start: 'Recorder started', stop: 'Recorder stopped', lid_opened: 'Lid opened', lid_closed: 'Lid closed',
-    knock: 'Knock', tilt: 'Tilted', tilt_cleared: 'Tilt cleared', rebaseline: 'New resting position',
-    clock_synced: 'Clock synced', baseline: 'Baseline captured'
-  };
-  const EVENT_COLOURS = {
-    lid_opened: '#d43f3f', lid_closed: '#2e9e4f', knock: '#e08a1e', tilt: '#7c5cd6', tilt_cleared: '#7c5cd6',
-    rebaseline: '#6b7280', start: '#3b82f6', stop: '#3b82f6', clock_synced: '#6b7280', baseline: '#6b7280'
-  };
+  // ---------- Tabs ----------
+  document.querySelectorAll('.tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentTab = btn.dataset.tab;
+      document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tabpanel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + currentTab));
+      if (currentTab === 'history') loadHistory();
+    });
+  });
+
+  function fmt(value, digits) {
+    return (value === undefined || value === null || isNaN(value)) ? '--' : Number(value).toFixed(digits);
+  }
+
+  function ageText(seconds) {
+    if (seconds === null || seconds === undefined) return 'no data yet';
+    if (seconds < 90) return Math.round(seconds) + ' s ago';
+    if (seconds < 5400) return Math.round(seconds / 60) + ' min ago';
+    return (seconds / 3600).toFixed(1) + ' h ago';
+  }
+
+  function whenText(ts) {
+    return new Date(ts).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
 
   function showError(text) {
     const el = document.getElementById('errorBanner');
@@ -290,10 +421,7 @@ PAGE = r"""<!doctype html>
     el.textContent = text || '';
   }
 
-  function fmt(value, digits) {
-    return (value === undefined || value === null || isNaN(value)) ? '--' : Number(value).toFixed(digits);
-  }
-
+  // ---------- Overview ----------
   function makeGauge(canvasId, colour) {
     return new Chart(document.getElementById(canvasId), {
       type: 'doughnut',
@@ -314,25 +442,21 @@ PAGE = r"""<!doctype html>
     g.update('none');
   }
 
-  function ageText(seconds) {
-    if (seconds === null || seconds === undefined) return 'no data yet';
-    if (seconds < 90) return Math.round(seconds) + ' s ago';
-    if (seconds < 5400) return Math.round(seconds / 60) + ' min ago';
-    return (seconds / 3600).toFixed(1) + ' h ago';
-  }
-
-  function whenText(ts) {
-    return new Date(ts).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }
+  const EVENT_LABELS = {
+    start: 'Recorder started', stop: 'Recorder stopped', lid_opened: 'Lid opened', lid_closed: 'Lid closed',
+    knock: 'Knock', tilt: 'Tilted', tilt_cleared: 'Tilt cleared', rebaseline: 'New resting position',
+    clock_synced: 'Clock synced', baseline: 'Baseline captured'
+  };
+  const EVENT_COLOURS = {
+    lid_opened: '#d43f3f', lid_closed: '#2e9e4f', knock: '#e08a1e', tilt: '#7c5cd6', tilt_cleared: '#7c5cd6',
+    rebaseline: '#6b7280', start: '#3b82f6', stop: '#3b82f6', clock_synced: '#6b7280', baseline: '#6b7280'
+  };
 
   function renderEvents(events) {
     const body = document.getElementById('eventRows');
     body.innerHTML = '';
     if (!events.length) {
-      const tr = document.createElement('tr');
-      const td = document.createElement('td');
-      td.colSpan = 3; td.className = 'muted'; td.textContent = 'No events in the last 24 hours';
-      tr.appendChild(td); body.appendChild(tr);
+      body.innerHTML = '<tr><td colspan="3" class="muted">No events in the last 24 hours</td></tr>';
       return;
     }
     for (const e of events) {
@@ -348,12 +472,35 @@ PAGE = r"""<!doctype html>
     }
   }
 
+  let lastLiveData = null;
+
+  function renderRaw(data) {
+    const body = document.getElementById('rawRows');
+    const L = data.latest || {};
+    const LT = data.latest_ts || {};
+    const keys = (data.known_sensors || Object.keys(L));
+    body.innerHTML = '';
+    for (const key of keys) {
+      const tr = document.createElement('tr');
+      const k = document.createElement('td'); k.textContent = key;
+      const v = document.createElement('td');
+      v.textContent = (key in L) ? L[key] : 'no data';
+      v.style.fontFamily = 'monospace';
+      const a = document.createElement('td');
+      a.textContent = (key in LT) ? ageText((Date.now() - LT[key]) / 1000) : '--';
+      tr.appendChild(k); tr.appendChild(v); tr.appendChild(a);
+      body.appendChild(tr);
+    }
+    document.getElementById('rawJson').textContent = JSON.stringify(data, null, 2);
+  }
+
   async function loadLive() {
     try {
       const res = await fetch('/api/live');
       const data = await res.json();
       showError(data.error || '');
       if (data.error) return;
+      lastLiveData = data;
 
       const L = data.latest || {};
       const statusEl = document.getElementById('deviceStatus');
@@ -371,6 +518,9 @@ PAGE = r"""<!doctype html>
 
       setGauge('tilt', L.tilt_deg, TILT_GAUGE_MAX);
       document.getElementById('vTilt').textContent = fmt(L.tilt_deg, 1) + '\u00B0';
+
+      document.getElementById('vTemp').textContent = (L.temperature_c === undefined) ? '--' : fmt(L.temperature_c, 1) + '\u00B0C';
+      document.getElementById('vHumidity').textContent = (L.humidity_percent === undefined) ? '--' : fmt(L.humidity_percent, 0) + '%';
 
       const lidEl = document.getElementById('vLid');
       if (L.lid_closed === undefined) {
@@ -390,47 +540,133 @@ PAGE = r"""<!doctype html>
       document.getElementById('sKnock').textContent = 'latest interval peak ' + fmt(L.knock_peak, 2) + ' m/s\u00B2';
 
       renderEvents(events);
+      renderRaw(data);
     } catch (err) {
       showError('Cannot reach the dashboard server: ' + err);
     }
   }
 
-  async function loadChart() {
-    lastChartLoad = Date.now();
+  // ---------- History ----------
+  let historyChart = null;
+  let selectedMinutes = 1440;
+  let selectedRange = null;   // {start, end} when a specific day is picked instead of a quick range
+
+  function buildSensorPicker() {
+    const sel = document.getElementById('sensorSelect');
+    const names = {
+      light_raw: 'Light (raw)', light_percent: 'Light (%)',
+      uv_raw: 'UV (raw)', uv_percent: 'UV (%)',
+      temperature_c: 'Temperature (\u00B0C)', humidity_percent: 'Humidity (%)',
+      lid_closed: 'Lid closed (1/0)', tilt_deg: 'Tilt (degrees)', knock_peak: 'Knock peak (m/s\u00B2)'
+    };
+    const known = (lastLiveData && lastLiveData.known_sensors) ||
+      ['light_percent', 'uv_percent', 'temperature_c', 'humidity_percent', 'tilt_deg', 'knock_peak', 'lid_closed', 'light_raw', 'uv_raw'];
+    sel.innerHTML = '';
+    for (const key of known) {
+      const opt = document.createElement('option');
+      opt.value = key; opt.textContent = names[key] || key;
+      sel.appendChild(opt);
+    }
+    sel.value = 'light_percent';
+    sel.addEventListener('change', loadHistory);
+  }
+
+  function buildDayPicker() {
+    const el = document.getElementById('dayPicker');
+    el.innerHTML = '';
+    const today = new Date();
+    for (let i = 0; i < 10; i++) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const btn = document.createElement('button');
+      btn.textContent = i === 0 ? 'Today' : d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+      btn.addEventListener('click', () => {
+        const start = new Date(d); start.setHours(0, 0, 0, 0);
+        const end = new Date(d); end.setHours(23, 59, 59, 999);
+        selectedRange = { start: start.getTime(), end: Math.min(end.getTime(), Date.now()) };
+        document.querySelectorAll('#rangeButtons button').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('#dayPicker button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        loadHistory();
+      });
+      el.appendChild(btn);
+    }
+  }
+
+  document.getElementById('rangeButtons').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    selectedRange = null;
+    selectedMinutes = parseInt(btn.dataset.minutes, 10);
+    document.querySelectorAll('#rangeButtons button').forEach(b => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('#dayPicker button').forEach(b => b.classList.remove('active'));
+    loadHistory();
+  });
+
+  function renderHistoryTable(rows) {
+    const body = document.getElementById('historyRows');
+    body.innerHTML = '';
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="2" class="muted">No data in this range</td></tr>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (let i = rows.length - 1; i >= 0; i--) {   // newest first in the table
+      const tr = document.createElement('tr');
+      const t1 = document.createElement('td'); t1.textContent = whenText(rows[i].ts);
+      const t2 = document.createElement('td'); t2.textContent = rows[i].value;
+      tr.appendChild(t1); tr.appendChild(t2);
+      frag.appendChild(tr);
+    }
+    body.appendChild(frag);
+  }
+
+  async function loadHistory() {
+    const sensor = document.getElementById('sensorSelect').value || 'light_percent';
+    const params = new URLSearchParams({ sensor });
+    if (selectedRange) {
+      params.set('start_ts', selectedRange.start);
+      params.set('end_ts', selectedRange.end);
+    } else {
+      params.set('minutes', selectedMinutes);
+    }
+
     try {
-      const res = await fetch('/api/chart?minutes=' + chartMinutes);
+      const res = await fetch('/api/chart?' + params.toString());
       const data = await res.json();
       if (data.error) { showError(data.error); return; }
-      const rows = data.rows || [];
-      const labels = rows.map(r => new Date(r.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
-      const light = rows.map(r => r.light);
-      const uv = rows.map(r => r.uv);
+      showError('');
 
-      if (!trendChart) {
-        trendChart = new Chart(document.getElementById('trendChart'), {
+      const rows = data.rows || [];
+      document.getElementById('chartRangeText').textContent =
+        whenText(data.start_ts) + ' to ' + whenText(data.end_ts) +
+        (data.truncated ? '  (showing the most recent points, the full range has more than fits)' : '');
+      document.getElementById('drillInfo').textContent = rows.length + ' point(s) in this range';
+
+      const step = Math.max(1, Math.ceil(rows.length / 500));
+      const thinned = rows.filter((_, i) => i % step === 0 || i === rows.length - 1);
+      const labels = thinned.map(r => new Date(r.ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+      const values = thinned.map(r => r.value);
+
+      if (!historyChart) {
+        historyChart = new Chart(document.getElementById('historyChart'), {
           type: 'line',
-          data: {
-            labels: labels,
-            datasets: [
-              { label: 'Light %', data: light, borderColor: '#e0a020', backgroundColor: '#e0a020', pointRadius: 0, tension: 0.2, spanGaps: true },
-              { label: 'UV %', data: uv, borderColor: '#7c5cd6', backgroundColor: '#7c5cd6', pointRadius: 0, tension: 0.2, spanGaps: true }
-            ]
-          },
+          data: { labels, datasets: [{ label: sensor, data: values, borderColor: '#2e6fe0',
+                   backgroundColor: '#2e6fe0', pointRadius: 0, tension: 0.15, spanGaps: true }] },
           options: {
             responsive: true, maintainAspectRatio: false, animation: false,
             interaction: { mode: 'index', intersect: false },
-            scales: {
-              y: { min: 0, max: 100, title: { display: true, text: '%' } },
-              x: { ticks: { maxTicksLimit: 8, autoSkip: true } }
-            }
+            scales: { x: { ticks: { maxTicksLimit: 8, autoSkip: true } } }
           }
         });
       } else {
-        trendChart.data.labels = labels;
-        trendChart.data.datasets[0].data = light;
-        trendChart.data.datasets[1].data = uv;
-        trendChart.update('none');
+        historyChart.data.labels = labels;
+        historyChart.data.datasets[0].data = values;
+        historyChart.data.datasets[0].label = sensor;
+        historyChart.update('none');
       }
+
+      renderHistoryTable(rows);
     } catch (err) {
       showError('Cannot reach the dashboard server: ' + err);
     }
@@ -438,17 +674,8 @@ PAGE = r"""<!doctype html>
 
   function refreshAll() {
     loadLive();
-    if (Date.now() - lastChartLoad > 14000) loadChart();
     remaining = REFRESH_MS;
   }
-
-  document.getElementById('windowButtons').addEventListener('click', function (ev) {
-    const btn = ev.target.closest('button');
-    if (!btn) return;
-    chartMinutes = parseInt(btn.dataset.min, 10);
-    for (const b of this.querySelectorAll('button')) b.classList.toggle('active', b === btn);
-    loadChart();
-  });
 
   if (typeof Chart === 'undefined') {
     showError('The chart library did not load. Check the internet connection and refresh.');
@@ -457,6 +684,9 @@ PAGE = r"""<!doctype html>
     gauges.uv = makeGauge('gUv', '#7c5cd6');
     gauges.tilt = makeGauge('gTilt', '#0e9aa7');
   }
+
+  buildSensorPicker();
+  buildDayPicker();
 
   setInterval(function () {
     remaining -= 100;
