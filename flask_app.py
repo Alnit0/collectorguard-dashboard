@@ -36,8 +36,8 @@ except ValueError:
 
 REFRESH_MS = 5000
 TB_TIMEOUT = 10
-EVENT_LIMIT = 30
-EVENT_HOURS = 24
+EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
+EVENT_HOURS = 168          # a full week, covering the whole deployment
 MAX_CHART_ROWS = 3000          # most rows ever returned for one chart/table request
 MAX_RANGE_MS = 8 * 24 * 3600 * 1000   # 8 days, a safety cap on how wide a single query can be
 
@@ -45,7 +45,6 @@ MAX_RANGE_MS = 8 * 24 * 3600 * 1000   # 8 days, a safety cap on how wide a singl
 # the rest of the page (the picker, the raw table) adapts on its own.
 KNOWN_SENSORS = [
     "light_raw", "light_percent", "uv_raw", "uv_percent",
-    "temperature_c", "humidity_percent",
     "lid_closed", "tilt_deg", "knock_peak",
     "accel_x", "accel_y", "accel_z",
 ]
@@ -302,6 +301,7 @@ PAGE = r"""<!doctype html>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="raw">Raw data</button>
     <button data-tab="history">History</button>
+    <button data-tab="errors">Errors</button>
   </div>
 
   <!-- ===================== Overview ===================== -->
@@ -323,16 +323,6 @@ PAGE = r"""<!doctype html>
         <div class="sub">degrees from resting position</div>
       </div>
       <div class="card">
-        <div class="big" id="vTemp">--</div>
-        <div class="label">Temperature</div>
-        <div class="sub" id="sTemp">&nbsp;</div>
-      </div>
-      <div class="card">
-        <div class="big" id="vHumidity">--</div>
-        <div class="label">Humidity</div>
-        <div class="sub" id="sHumidity">&nbsp;</div>
-      </div>
-      <div class="card">
         <div class="big" id="vLid">--</div>
         <div class="label">Lid</div>
         <div class="sub">reed switch</div>
@@ -343,23 +333,6 @@ PAGE = r"""<!doctype html>
         <div class="sub" id="sKnock">latest interval peak --</div>
       </div>
     </div>
-
-    <details class="panel">
-      <summary>Box orientation (3D view)</summary>
-      <div class="orientWrap">
-        <div class="scene3d">
-          <div class="cubeSpin" id="orientCube">
-            <div class="cubeFace faceTop">TOP</div>
-            <div class="cubeFace faceBottom"></div>
-            <div class="cubeFace faceFront"></div>
-            <div class="cubeFace faceBack"></div>
-            <div class="cubeFace faceRight"></div>
-            <div class="cubeFace faceLeft"></div>
-          </div>
-        </div>
-        <div class="orientReadout" id="orientText">Waiting for accelerometer data...</div>
-      </div>
-    </details>
 
     <div class="panel">
       <h2>Recent events</h2>
@@ -386,6 +359,37 @@ PAGE = r"""<!doctype html>
       <h2>Full response (/api/live)</h2>
       <p class="muted">The complete JSON this page is reading from, for when the table above isn't enough.</p>
       <pre class="rawJson" id="rawJson">Loading...</pre>
+    </div>
+
+    <details class="panel">
+      <summary>Box orientation (3D view)</summary>
+      <div class="orientWrap">
+        <div class="scene3d">
+          <div class="cubeSpin" id="orientCube">
+            <div class="cubeFace faceTop">TOP</div>
+            <div class="cubeFace faceBottom"></div>
+            <div class="cubeFace faceFront"></div>
+            <div class="cubeFace faceBack"></div>
+            <div class="cubeFace faceRight"></div>
+            <div class="cubeFace faceLeft"></div>
+          </div>
+        </div>
+        <div class="orientReadout" id="orientText">Waiting for accelerometer data...</div>
+      </div>
+    </details>
+  </div>
+
+  <!-- ===================== Errors ===================== -->
+  <div id="tab-errors" class="tabpanel">
+    <div class="panel">
+      <h2>Error log</h2>
+      <p class="muted" id="errorSummary">&nbsp;</p>
+      <div class="scrollTable">
+        <table>
+          <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+          <tbody id="errorRows"><tr><td colspan="3" class="muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -491,13 +495,14 @@ PAGE = r"""<!doctype html>
     error_start: '#d43f3f', error_cleared: '#2e9e4f'
   };
 
-  function renderEvents(events) {
-    const body = document.getElementById('eventRows');
+  function renderEventTable(events, bodyId, emptyText) {
+    const body = document.getElementById(bodyId);
     body.innerHTML = '';
     if (!events.length) {
-      body.innerHTML = '<tr><td colspan="3" class="muted">No events in the last 24 hours</td></tr>';
+      body.innerHTML = `<tr><td colspan="3" class="muted">${emptyText}</td></tr>`;
       return;
     }
+    const frag = document.createDocumentFragment();
     for (const e of events) {
       const tr = document.createElement('tr');
       const t1 = document.createElement('td'); t1.textContent = whenText(e.ts);
@@ -507,8 +512,26 @@ PAGE = r"""<!doctype html>
       t2.appendChild(dot); t2.appendChild(document.createTextNode(EVENT_LABELS[e.type] || e.type));
       const t3 = document.createElement('td'); t3.textContent = e.detail;
       tr.appendChild(t1); tr.appendChild(t2); tr.appendChild(t3);
-      body.appendChild(tr);
+      frag.appendChild(tr);
     }
+    body.appendChild(frag);
+  }
+
+  function renderEvents(events) {
+    // Errors get their own tab, with their own space, so a run of frequent errors can never
+    // crowd lid/knock/tilt events out of this list the way a single shared table used to.
+    const isError = e => e.type === 'error_start' || e.type === 'error_cleared';
+    const normal = events.filter(e => !isError(e));
+    const errors = events.filter(isError);
+
+    renderEventTable(normal, 'eventRows', 'No events in the last week');
+    renderEventTable(errors, 'errorRows', 'No errors logged in the last week');
+
+    const starts = errors.filter(e => e.type === 'error_start').length;
+    const summary = document.getElementById('errorSummary');
+    summary.textContent = starts
+      ? `${starts} error period(s) in the last week. Most recent: ${whenText(errors[0].ts)}, ${errors[0].detail}`
+      : 'No errors logged in the last week.';
   }
 
   let lastLiveData = null;
@@ -586,9 +609,6 @@ PAGE = r"""<!doctype html>
 
       updateOrientation(L);
 
-      document.getElementById('vTemp').textContent = (L.temperature_c === undefined) ? '--' : fmt(L.temperature_c, 1) + '\u00B0C';
-      document.getElementById('vHumidity').textContent = (L.humidity_percent === undefined) ? '--' : fmt(L.humidity_percent, 0) + '%';
-
       const lidEl = document.getElementById('vLid');
       if (L.lid_closed === undefined) {
         lidEl.textContent = '--'; lidEl.style.color = '';
@@ -623,12 +643,11 @@ PAGE = r"""<!doctype html>
     const names = {
       light_raw: 'Light (raw)', light_percent: 'Light (%)',
       uv_raw: 'UV (raw)', uv_percent: 'UV (%)',
-      temperature_c: 'Temperature (\u00B0C)', humidity_percent: 'Humidity (%)',
       lid_closed: 'Lid closed (1/0)', tilt_deg: 'Tilt (degrees)', knock_peak: 'Knock peak (m/s\u00B2)',
       accel_x: 'Accelerometer X (raw)', accel_y: 'Accelerometer Y (raw)', accel_z: 'Accelerometer Z (raw)'
     };
     const known = (lastLiveData && lastLiveData.known_sensors) ||
-      ['light_percent', 'uv_percent', 'temperature_c', 'humidity_percent', 'tilt_deg', 'knock_peak', 'lid_closed', 'light_raw', 'uv_raw'];
+      ['light_percent', 'uv_percent', 'tilt_deg', 'knock_peak', 'lid_closed', 'light_raw', 'uv_raw', 'accel_x', 'accel_y', 'accel_z'];
     sel.innerHTML = '';
     for (const key of known) {
       const opt = document.createElement('option');
