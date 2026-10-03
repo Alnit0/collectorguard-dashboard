@@ -34,7 +34,7 @@ try:
 except ValueError:
     STALE_SECONDS = 30
 
-REFRESH_MS = 5000
+REFRESH_MS = 60000
 TB_TIMEOUT = 10
 EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
 EVENT_HOURS = 168          # a full week, covering the whole deployment
@@ -153,6 +153,7 @@ def api_live():
         "device_online": age is not None and age <= STALE_SECONDS,
         "events": events,
         "events_truncated": truncated,
+        "event_window_hours": EVENT_HOURS,
         "known_sensors": KNOWN_SENSORS,
     })
 
@@ -519,7 +520,38 @@ PAGE = r"""<!doctype html>
     body.appendChild(frag);
   }
 
-  function renderEvents(events) {
+  function durationText(ms) {
+    const totalMin = Math.round(ms / 60000);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return h === 0 ? `${m}m` : `${h}h ${m}m`;
+  }
+
+  // Pairs up each error_start with the error_cleared that follows it to work out how long each
+  // problem period actually lasted, so the dashboard can show real uptime, not just a count of
+  // incidents. An error_start with no matching error_cleared yet is still ongoing, and counts
+  // as down right up to the current moment.
+  function computeDowntime(errors, windowHours) {
+    const chrono = [...errors].reverse();   // the API returns newest first; walk oldest to newest
+    let totalDownMs = 0;
+    let openStart = null;
+    for (const e of chrono) {
+      if (e.type === 'error_start') {
+        if (openStart === null) openStart = e.ts;
+      } else if (e.type === 'error_cleared' && openStart !== null) {
+        totalDownMs += e.ts - openStart;
+        openStart = null;
+      }
+    }
+    const ongoing = openStart !== null;
+    if (ongoing) totalDownMs += Date.now() - openStart;
+
+    const windowMs = windowHours * 3600 * 1000;
+    const uptimePct = Math.max(0, Math.min(100, 100 * (1 - totalDownMs / windowMs)));
+    return { totalDownMs, uptimePct, ongoing };
+  }
+
+  function renderEvents(events, windowHours) {
     // Errors get their own tab, with their own space, so a run of frequent errors can never
     // crowd lid/knock/tilt events out of this list the way a single shared table used to.
     const isError = e => e.type === 'error_start' || e.type === 'error_cleared';
@@ -531,9 +563,16 @@ PAGE = r"""<!doctype html>
 
     const starts = errors.filter(e => e.type === 'error_start').length;
     const summary = document.getElementById('errorSummary');
-    summary.textContent = starts
-      ? `${starts} error period(s) in the last week. Most recent: ${whenText(errors[0].ts)}, ${errors[0].detail}`
-      : 'No errors logged in the last week.';
+    if (!starts) {
+      summary.textContent = `100% uptime over the last ${windowHours} hours. No errors logged.`;
+      return;
+    }
+    const { totalDownMs, uptimePct, ongoing } = computeDowntime(errors, windowHours);
+    const liveNote = ongoing ? ' (currently down)' : '';
+    summary.textContent =
+      `${uptimePct.toFixed(2)}% uptime over the last ${windowHours} hours` +
+      ` — ${durationText(totalDownMs)} of downtime across ${starts} incident(s)${liveNote}.` +
+      ` Most recent: ${whenText(errors[0].ts)}, ${errors[0].detail}`;
   }
 
   let lastLiveData = null;
@@ -633,7 +672,7 @@ PAGE = r"""<!doctype html>
       document.getElementById('vKnocks').textContent = recentKnocks + (capped ? '+' : '');
       document.getElementById('sKnock').textContent = 'latest interval peak ' + fmt(L.knock_peak, 2) + ' m/s\u00B2';
 
-      renderEvents(events);
+      renderEvents(events, data.event_window_hours || 168);
       renderRaw(data);
     } catch (err) {
       showError('Cannot reach the dashboard server: ' + err);
