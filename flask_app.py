@@ -32,9 +32,9 @@ API_KEY = os.environ.get("TB_API_KEY", "").strip()
 try:
     STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "30"))
 except ValueError:
-    STALE_SECONDS = 150
+    STALE_SECONDS = 30
 
-REFRESH_MS = 60000
+REFRESH_MS = 5000
 TB_TIMEOUT = 10
 EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
 EVENT_HOURS = 168          # a full week, covering the whole deployment
@@ -287,7 +287,7 @@ PAGE = r"""<!doctype html>
 </style>
 </head>
 <body>
-<div id="countdown">Next refresh in <span id="countdownValue">__REFRESH_MS__</span> ms</div>
+<div id="countdown">Next update expected in <span id="countdownValue">--</span></div>
 <div class="wrap">
   <header>
     <h1>CollectorGuard</h1>
@@ -425,10 +425,12 @@ PAGE = r"""<!doctype html>
 </div>
 
 <script>
-  const REFRESH_MS = __REFRESH_MS__;
+  const REFRESH_MS = __REFRESH_MS__;        // how often the browser polls the server
+  const LOG_INTERVAL_MS = 60000;            // how often the Pi actually logs a new reading
   const TILT_GAUGE_MAX = 45;
   const gauges = {};
-  let remaining = REFRESH_MS;
+  let nextExpectedTs = null;                // when the next real reading should land, worked
+                                             // out from the last one's own age, not a fixed timer
   let currentTab = 'overview';
 
   // ---------- Tabs ----------
@@ -596,6 +598,11 @@ PAGE = r"""<!doctype html>
       statusEl.style.color = data.device_online ? '#2e9e4f' : '#d43f3f';
       document.getElementById('lastData').textContent = 'Last data ' + ageText(data.age_seconds);
 
+      if (data.age_seconds !== null && data.age_seconds !== undefined) {
+        const lastUpdateTs = Date.now() - data.age_seconds * 1000;
+        nextExpectedTs = lastUpdateTs + LOG_INTERVAL_MS;
+      }
+
       setGauge('light', L.light_percent, 100);
       document.getElementById('vLight').textContent = fmt(L.light_percent, 0) + '%';
       document.getElementById('sLight').textContent = 'raw ' + fmt(L.light_raw, 0) + ' (lower = brighter)';
@@ -761,7 +768,14 @@ PAGE = r"""<!doctype html>
 
   function refreshAll() {
     loadLive();
-    remaining = REFRESH_MS;
+  }
+
+  function countdownText() {
+    if (nextExpectedTs === null) return '--';
+    const remainingMs = nextExpectedTs - Date.now();
+    if (remainingMs < -2000) return 'overdue';           // genuinely late, not just a rounding edge
+    const secs = Math.max(0, Math.round(remainingMs / 1000));
+    return secs + ' s';
   }
 
   if (typeof Chart === 'undefined') {
@@ -776,10 +790,8 @@ PAGE = r"""<!doctype html>
   buildDayPicker();
 
   setInterval(function () {
-    remaining -= 100;
-    if (remaining < 0) remaining = 0;
-    document.getElementById('countdownValue').textContent = remaining;
-  }, 100);
+    document.getElementById('countdownValue').textContent = countdownText();
+  }, 250);
 
   refreshAll();
   setInterval(refreshAll, REFRESH_MS);
