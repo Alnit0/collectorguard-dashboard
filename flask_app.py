@@ -482,11 +482,13 @@ PAGE = r"""<!doctype html>
   const EVENT_LABELS = {
     start: 'Recorder started', stop: 'Recorder stopped', lid_opened: 'Lid opened', lid_closed: 'Lid closed',
     knock: 'Knock', tilt: 'Tilted', tilt_cleared: 'Tilt cleared', rebaseline: 'New resting position',
-    clock_synced: 'Clock synced', baseline: 'Baseline captured'
+    clock_synced: 'Clock synced', baseline: 'Baseline captured',
+    error_start: 'Error', error_cleared: 'Error cleared'
   };
   const EVENT_COLOURS = {
     lid_opened: '#d43f3f', lid_closed: '#2e9e4f', knock: '#e08a1e', tilt: '#7c5cd6', tilt_cleared: '#7c5cd6',
-    rebaseline: '#6b7280', start: '#3b82f6', stop: '#3b82f6', clock_synced: '#6b7280', baseline: '#6b7280'
+    rebaseline: '#6b7280', start: '#3b82f6', stop: '#3b82f6', clock_synced: '#6b7280', baseline: '#6b7280',
+    error_start: '#d43f3f', error_cleared: '#2e9e4f'
   };
 
   function renderEvents(events) {
