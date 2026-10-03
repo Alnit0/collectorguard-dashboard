@@ -32,9 +32,9 @@ API_KEY = os.environ.get("TB_API_KEY", "").strip()
 try:
     STALE_SECONDS = int(os.environ.get("STALE_SECONDS", "30"))
 except ValueError:
-    STALE_SECONDS = 30
+    STALE_SECONDS = 150
 
-REFRESH_MS = 5000
+REFRESH_MS = 60000
 TB_TIMEOUT = 10
 EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
 EVENT_HOURS = 168          # a full week, covering the whole deployment
