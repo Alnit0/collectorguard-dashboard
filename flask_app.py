@@ -8,6 +8,8 @@ Settings come from environment variables on Render:
     TB_API_KEY      the ThingsBoard API key that can read telemetry (required)
     STALE_SECONDS   seconds without new data before the device shows as offline (default 30).
                     Use about 150 when the Pi logs every 60 seconds.
+    REFRESH_MS      how often the page asks for new data, in milliseconds (default 60000)
+    LOG_INTERVAL_MS how often the Pi logs a reading, in milliseconds, used for the countdown (default 60000)
     TB_BASE         only if you use a different ThingsBoard address (default https://thingsboard.cloud)
 
 Three views, switched with the tabs at the top:
@@ -34,7 +36,19 @@ try:
 except ValueError:
     STALE_SECONDS = 30
 
-REFRESH_MS = 60000
+def env_ms(name, default):
+    try:
+        value = int(os.environ.get(name, default))
+        return value if value >= 1000 else default
+    except ValueError:
+        return default
+
+
+# How often the browser asks the server for new data, and how often the Pi logs a reading.
+# Both default to 60 seconds. For a fast test, set REFRESH_MS and LOG_INTERVAL_MS (milliseconds)
+# as environment variables on the server, for example 3000, and remove them afterwards.
+REFRESH_MS = env_ms("REFRESH_MS", 60000)
+LOG_INTERVAL_MS = env_ms("LOG_INTERVAL_MS", 60000)
 TB_TIMEOUT = 10
 EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
 EVENT_HOURS = 168          # a full week, covering the whole deployment
@@ -427,7 +441,7 @@ PAGE = r"""<!doctype html>
 
 <script>
   const REFRESH_MS = __REFRESH_MS__;        // how often the browser polls the server
-  const LOG_INTERVAL_MS = 60000;            // how often the Pi actually logs a new reading
+  const LOG_INTERVAL_MS = __LOG_INTERVAL_MS__;            // how often the Pi actually logs a new reading
   const TILT_GAUGE_MAX = 45;
   const gauges = {};
   let nextExpectedTs = null;                // when the next real reading should land, worked
@@ -842,7 +856,7 @@ PAGE = r"""<!doctype html>
 
 @app.route("/")
 def dashboard():
-    return PAGE.replace("__REFRESH_MS__", str(REFRESH_MS))
+    return PAGE.replace("__REFRESH_MS__", str(REFRESH_MS)).replace("__LOG_INTERVAL_MS__", str(LOG_INTERVAL_MS))
 
 
 if __name__ == "__main__":
