@@ -47,8 +47,8 @@ def env_ms(name, default):
 # How often the browser asks the server for new data, and how often the Pi logs a reading.
 # Both default to 60 seconds. For a fast test, set REFRESH_MS and LOG_INTERVAL_MS (milliseconds)
 # as environment variables on the server, for example 3000, and remove them afterwards.
-REFRESH_MS = env_ms("REFRESH_MS", 1000)
-LOG_INTERVAL_MS = env_ms("LOG_INTERVAL_MS", 1000)
+REFRESH_MS = env_ms("REFRESH_MS", 3000)
+LOG_INTERVAL_MS = env_ms("LOG_INTERVAL_MS", 3000)
 TB_TIMEOUT = 10
 EVENT_LIMIT = 400          # high enough that error noise can't crowd out real events
 EVENT_HOURS = 168          # a full week, covering the whole deployment
@@ -535,7 +535,7 @@ PAGE = r"""<!doctype html>
   }
 
   function durationText(ms) {
-    const totalMin = Math.round(ms / 3000);
+    const totalMin = Math.round(ms / 60000);
     const h = Math.floor(totalMin / 60);
     const m = totalMin % 60;
     return h === 0 ? `${m}m` : `${h}h ${m}m`;
